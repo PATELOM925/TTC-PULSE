@@ -1,7 +1,9 @@
 """Export the gold marts to small JSON files for the TTC Pulse dashboard on iampatelom.com.
 
-Usage: python scripts/export_site_data.py <output_dir>
+Usage: python scripts/export_site_data.py <output_dir> [<entity_dir>]
 Run it from the repository root. It reads the committed Parquet files only.
+With <entity_dir>, it also writes one drill-down file per route, station and line,
+and drill-index.json in <output_dir>.
 """
 
 from __future__ import annotations
@@ -16,8 +18,11 @@ import sys
 import duckdb
 
 YEARS = list(range(2014, 2026))
+DRILL_YEARS = list(range(2014, 2027))  # 2026 has January only
 MODES = ("bus", "streetcar", "subway")
 TOP_ENTITIES = 40
+DRILL_MIN_EVENTS = 20
+DRILL_TOP_CAUSES = 5
 CODE_PATTERN = "^[A-Z]{3,6}$"  # newer rows carry a raw incident code, not a name
 
 
@@ -41,7 +46,188 @@ def write(out_dir: str, name: str, payload: object) -> None:
     print(f"{name:18s} {os.path.getsize(path):8d} bytes")
 
 
-def main(out_dir: str) -> None:
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+# Drill-down scopes: (mode, scope, key column in the core mart, metric mart, key column in the metric mart).
+DRILL_SCOPES = (
+    ("bus", "route", "route_id_gtfs", "gold_route_time_metrics", "route_id_gtfs"),
+    ("streetcar", "route", "route_id_gtfs", "gold_route_time_metrics", "route_id_gtfs"),
+    ("subway", "station", "station_canonical", "gold_station_time_metrics", "station_canonical"),
+    ("subway", "line", "route_id_gtfs", "gold_route_time_metrics", "route_id_gtfs"),
+)
+
+# Silver rows with the same key, date and delay rules as the delay_events_src view in
+# src/ttc_pulse/marts/_gold_utils.py. The core mart groups this view, so the counts agree.
+SILVER_EVENTS = """(
+    SELECT
+        COALESCE(NULLIF(TRIM(mode), ''), NULLIF(TRIM(source_mode), ''), 'unknown') AS mode,
+        year(COALESCE(service_date, CAST(event_ts AS DATE))) AS year,
+        COALESCE(NULLIF(TRIM(route_id_gtfs), ''), NULLIF(TRIM(route_short_name_norm), ''), NULLIF(TRIM(line_code_norm), '')) AS route_id_gtfs,
+        COALESCE(NULLIF(TRIM(station_canonical), ''), NULLIF(TRIM(station_text_raw), ''), NULLIF(TRIM(location_text_raw), '')) AS station_canonical,
+        CASE
+            WHEN min_delay IS NULL THEN NULL
+            WHEN lower(COALESCE(NULLIF(TRIM(mode), ''), NULLIF(TRIM(source_mode), ''), 'unknown')) = 'bus' AND min_delay >= 999 THEN NULL
+            WHEN min_delay < 0 THEN 0
+            ELSE min_delay
+        END AS delay
+    FROM read_parquet('silver/fact_delay_events_norm.parquet')
+)"""
+
+
+def export_drill(rows, label, totals: dict, commit: str, out_dir: str, entity_dir: str) -> None:
+    """Write drill-index.json and one file per entity with at least DRILL_MIN_EVENTS delay events.
+
+    Metric windows:
+    - Frequency, Regularity, Severity, Cause Mix and Composite Score use the full window,
+      2014-01-01 to 2026-01-31. This is the default date window of the Streamlit drill-down page.
+      The definitions are the ones in src/ttc_pulse/dashboard/metric_config.py, over the hourly
+      rows of the gold metric marts: Frequency is the sum of events. Severity and Regularity are
+      the p90 of the hourly p90 delay and gap minutes. Cause Mix is the mean hourly cause mix.
+      Composite is 0.35 z(F) + 0.30 z(Sev) + 0.20 z(Reg) + 0.15 C, with z over all entities of
+      the same mode and scope.
+    - The Hotspots ranking on the site uses gold_top_offender_ranking, which is the last 90 days.
+      So its scores differ from these scores.
+    - The entity files hold event counts from gold_delay_events_core by year, month, weekday
+      and hour, and delay minutes (median and p90 of each event) from the silver rows by year.
+    """
+    os.makedirs(entity_dir, exist_ok=True)
+    for name in os.listdir(entity_dir):
+        if name.endswith(".json"):
+            os.remove(os.path.join(entity_dir, name))
+    core = gold("gold_delay_events_core")
+    index, sizes, files = [], [], set()
+    for mode, scope, key_col, mart, mart_col in DRILL_SCOPES:
+        metrics = {
+            key: (f, sev, reg, mix, score)
+            for key, f, sev, reg, mix, score in rows(
+                f"""
+                WITH entity_agg AS (
+                    SELECT {mart_col} AS entity_id,
+                        SUM(frequency)::DOUBLE AS frequency,
+                        quantile_cont(severity_p90, 0.9) FILTER (WHERE severity_p90 IS NOT NULL) AS severity_p90,
+                        quantile_cont(regularity_p90, 0.9) FILTER (WHERE regularity_p90 IS NOT NULL) AS regularity_p90,
+                        AVG(cause_mix_score) FILTER (WHERE cause_mix_score IS NOT NULL) AS cause_mix_score
+                    FROM {gold(mart)}
+                    WHERE {mart_col} IS NOT NULL AND {mart_col} <> '' AND service_date IS NOT NULL
+                        {"AND mode = ?" if mart == "gold_route_time_metrics" else ""}
+                    GROUP BY 1
+                )
+                SELECT entity_id, frequency, severity_p90, regularity_p90, COALESCE(cause_mix_score, 0.0),
+                    0.35 * COALESCE((frequency - AVG(frequency) OVER ()) / NULLIF(STDDEV_SAMP(frequency) OVER (), 0.0), 0.0)
+                    + 0.30 * COALESCE((severity_p90 - AVG(severity_p90) OVER ()) / NULLIF(STDDEV_SAMP(severity_p90) OVER (), 0.0), 0.0)
+                    + 0.20 * COALESCE((regularity_p90 - AVG(regularity_p90) OVER ()) / NULLIF(STDDEV_SAMP(regularity_p90) OVER (), 0.0), 0.0)
+                    + 0.15 * COALESCE(cause_mix_score, 0.0)
+                FROM entity_agg
+                """,
+                *([mode] if mart == "gold_route_time_metrics" else []),
+            )
+        }
+        counts = rows(f"SELECT {key_col}, sum(event_count) n FROM {core} WHERE mode = ? AND {key_col} IS NOT NULL GROUP BY 1 ORDER BY n DESC", mode)
+        null_events = rows(f"SELECT coalesce(sum(event_count), 0) FROM {core} WHERE mode = ? AND {key_col} IS NULL", mode)[0][0]
+        # Every event is on one entity or has no key. So the entity counts plus the NULL keys give the mode total.
+        assert sum(n for _, n in counts) + null_events == totals[mode], (mode, scope)
+        for key, n in counts:
+            assert int(metrics[key][0]) == n, (mode, scope, key)  # the metric mart and the core mart agree
+        keep = {key: int(n) for key, n in counts if n >= DRILL_MIN_EVENTS}
+
+        ny = len(DRILL_YEARS)
+        cube = {key: {"years": [0] * ny, "months": [[0] * 12 for _ in range(ny)], "days": [[0] * 84 for _ in range(ny)], "grid": [[0] * 168 for _ in range(ny)]} for key in keep}
+        for key, y, m, d, h, c in rows(
+            f"""SELECT {key_col}, year(service_date), month(service_date), isodow(service_date) - 1, hour_bin, sum(event_count)
+                FROM {core} WHERE mode = ? AND {key_col} IS NOT NULL GROUP BY ALL""",
+            mode,
+        ):
+            if key not in cube:
+                continue
+            e, yi, c = cube[key], DRILL_YEARS.index(y), int(c)
+            e["years"][yi] += c
+            e["months"][yi][m - 1] += c
+            e["days"][yi][(m - 1) * 7 + d] += c
+            e["grid"][yi][d * 24 + h] += c
+
+        cause_rows = {}
+        for key, y, cause, c in rows(
+            f"SELECT {key_col}, year(service_date), incident_category, sum(event_count) n FROM {core} WHERE mode = ? AND {key_col} IS NOT NULL GROUP BY ALL ORDER BY n DESC, 3",
+            mode,
+        ):
+            if key in keep:
+                cause_rows.setdefault(key, []).append((DRILL_YEARS.index(y), cause or "Uncategorized", int(c)))
+
+        delay = {}
+        for key, y, p50, p90 in rows(
+            f"SELECT {key_col}, year, quantile_cont(delay, 0.5), quantile_cont(delay, 0.9) FROM {SILVER_EVENTS} WHERE mode = ? AND {key_col} IS NOT NULL GROUP BY ALL",
+            mode,
+        ):
+            delay[(key, y)] = None if p50 is None else [round(p50, 1), round(p90, 1)]
+        delay_all = {
+            key: None if p50 is None else [round(p50, 1), round(p90, 1)]
+            for key, p50, p90 in rows(f"SELECT {key_col}, quantile_cont(delay, 0.5), quantile_cont(delay, 0.9) FROM {SILVER_EVENTS} WHERE mode = ? AND {key_col} IS NOT NULL GROUP BY 1", mode)
+        }
+
+        for key, n in keep.items():
+            e = cube[key]
+            assert sum(e["years"]) == n, (mode, scope, key)
+            names: list[str] = []
+
+            def pos(cause: str) -> int:
+                if cause not in names:
+                    names.append(cause)
+                return names.index(cause)
+
+            totals_by_cause: dict[str, int] = {}
+            by_year = []
+            for yi in range(ny):
+                year_rows = [(cause, c) for i, cause, c in cause_rows[key] if i == yi]
+                top = year_rows[:DRILL_TOP_CAUSES]
+                by_year.append([[[pos(cause), c] for cause, c in top], e["years"][yi] - sum(c for _, c in top)])
+                for cause, c in year_rows:
+                    totals_by_cause[cause] = totals_by_cause.get(cause, 0) + c
+            top_all = sorted(totals_by_cause.items(), key=lambda kv: (-kv[1], kv[0]))[: DRILL_TOP_CAUSES + 1]
+            entity_id = f"line-{key}" if scope == "line" else key
+            name = label(mode, key) if scope != "line" else label("bus", key)
+            file = f"{mode}-{slug(entity_id)}"
+            assert file not in files, file
+            files.add(file)
+            payload = {
+                "id": entity_id,
+                "name": name,
+                "mode": mode,
+                "scope": scope,
+                "n": n,
+                "y0": DRILL_YEARS[0],
+                "years": e["years"],
+                "months": e["months"],
+                "days": e["days"],  # per year: month * 7 + weekday, Monday = 0
+                "grid": e["grid"],  # per year: weekday * 24 + hour
+                "causes": {
+                    "names": names,
+                    "all": [[[pos(cause), c] for cause, c in top_all], n - sum(c for _, c in top_all)],
+                    "byYear": by_year,  # per year: top causes as [name index, events], then the rest
+                },
+                "delay": [delay.get((key, y)) for y in DRILL_YEARS],  # per year: [median, p90] minutes, or null
+                "delayAll": delay_all.get(key),
+            }
+            path = os.path.join(entity_dir, f"{file}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"), ensure_ascii=False)
+            sizes.append((os.path.getsize(path), file))
+            f, sev, reg, mix, score = metrics[key]
+            index.append({
+                "id": entity_id, "file": file, "name": name, "mode": mode, "scope": scope, "n": n,
+                "sev": None if sev is None else round(sev, 1), "reg": None if reg is None else round(reg, 1),
+                "mix": round(mix, 3), "score": round(score, 3),
+            })
+        print(f"drill {mode:9s} {scope:7s} {len(keep):4d} of {len(counts):4d} entities, {sum(keep.values()):7d} of {totals[mode]:7d} events, no key {null_events}")
+    write(out_dir, "drill-index.json", {"meta": {"commit": commit, "y0": DRILL_YEARS[0], "minEvents": DRILL_MIN_EVENTS}, "entities": index})
+    sizes.sort(reverse=True)
+    print(f"entity files       {len(sizes):8d} files, {sum(s for s, _ in sizes):8d} bytes, largest {sizes[0][0]} bytes ({sizes[0][1]})")
+    if sizes[0][0] > 20_000:
+        print("warning: an entity file is larger than 20 KB")
+
+
+def main(out_dir: str, entity_dir: str | None = None) -> None:
     os.makedirs(out_dir, exist_ok=True)
     con = duckdb.connect()
     rows = lambda sql, *p: con.execute(sql, list(p)).fetchall()
@@ -163,8 +349,11 @@ def main(out_dir: str) -> None:
     write(out_dir, "alerts.json", alerts)
     write(out_dir, "sample.json", sample)
 
+    if entity_dir:
+        export_drill(rows, label, {mode: overview[mode]["total"] for mode in MODES}, commit, out_dir, entity_dir)
+
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("Usage: python scripts/export_site_data.py <output_dir>")
-    main(sys.argv[1])
+    if len(sys.argv) not in (2, 3):
+        sys.exit("Usage: python scripts/export_site_data.py <output_dir> [<entity_dir>]")
+    main(*sys.argv[1:])
